@@ -1,28 +1,39 @@
 import torch
 import numpy as np
 import torch_mlir
+from mlir_importer import MLIR_TYPE_TO_NUMPY
 from torch_mlir.ir import (
     Location, DenseElementsAttr, IntegerAttr, FloatAttr, StringAttr,
 )
 from typing import Optional, Union, List, Sequence, Dict
 
+def register_operand(sym_table: Dict[str, object], name: str, operand):
+    if name in sym_table:
+        if sym_table[name] != operand:
+            raise KeyError(f"operand {name} conflict")
+    sym_table[name] = operand
+
+TORCH_DTYPE_TO_IMPORTER = {
+    torch.float16: "F16",
+    torch.float32: "F32",
+    torch.float64: "F64",
+    torch.int8: "INT8",
+    torch.uint8: "UINT8",
+    torch.int16: "INT16",
+    torch.int32: "INT32",
+    torch.int64: "INT64",
+    torch.bool: "BOOL",
+    torch.bfloat16: "BF16",
+}
+
 def torch_to_importer_str(dtype: torch.dtype) -> str:
-    """将 PyTorch 数据类型映射为 MLIR Importer 支持的字符串。"""
-    dtype_map = {
-        torch.float16: "F16",
-        torch.float32: "F32",
-        torch.int8: "INT8",
-        torch.int16: "INT16",
-        torch.int32: "INT32",
-        torch.bfloat16: "BF16"
-    }
-    if dtype in dtype_map:
-        return dtype_map[dtype]
+    if dtype in TORCH_DTYPE_TO_IMPORTER:
+        return TORCH_DTYPE_TO_IMPORTER[dtype]
     raise NotImplementedError(f"Unsupported dtype {dtype}")
 
 class Tensor(object):
     """
-    表示计算图中的动态数据边 (Edge / Activation)。
+    表示计算图中的数据流动 (Edge / Activation)
     """
     def __init__(self, name: str, dtype, shape: List[int], has_Parent: bool = False):
         self._name: str = name
@@ -46,8 +57,7 @@ class Tensor(object):
 
 class parameter(object):
     """
-    表示计算图中的静态参数常量 (Node Constant / Weights / Bias / RoPE tables)。
-    会在 convertLayer 时被 lowering 为 hlo.ConstantOp。
+    表示计算图中的权重参数常量 (Node Constant / Weights / Bias / RoPE tables)
     """
     def __init__(self,
                  value: Optional[Union[np.ndarray, torch.Tensor]] = None,
@@ -75,21 +85,14 @@ class parameter(object):
 
 class Layer(object):
     """
-    计算图中的计算节点 (Node / Operation)。
+    计算图中的计算节点
     """
     def __init__(self, name: str = None, outputs: List[Tensor] = None, inputs: List[Tensor] = None, params: List[parameter] = None):
         self.name: str = name
         self.outputs: List[Tensor] = outputs if outputs is not None else []
         self.inputs: List[Tensor] = inputs if inputs is not None else []
         self.params: List[parameter] = params if params is not None else []
-        # 优化：显式声明残差属性，抛弃 hasattr 这种危险的动态检测
         self.has_residual: bool = False 
-
-# Tensor A --(used by)--> Layer B --(produces)--> Tensor C
-# Layer B.inputs = [Tensor A]
-# Tensor A.users = [Layer B]
-# Layer B.outputs = [Tensor C]
-# Tensor C.producer = Layer B
 
     # Appends that tensor to self.inputs, meaning "this layer consumes this edge"
     # Appends self to tensor.users, meaning "this tensor is used by this layer"
@@ -112,90 +115,78 @@ class Layer(object):
             tensor.producer = self
 
     def add_params(self, params: Union[parameter, List[parameter], None]):
+        # 把原本独立的权重参数合并到大算子中作为参数
         if params is None:
             self.params.append(None)
             return 
         params_to_add = [params] if isinstance(params, parameter) else params
         self.params.extend(params_to_add)
-            
+
     def load_params(self, dtype, hf_w: Dict, prefix: str, key_list: Optional[Union[List[str], str]] = None):
+        # key_list is None: 说明 curr_layer 是单权重参数 (embedding, finale_norm, up_projection)
+        # eg. ['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj', 'self_attn.o_proj', 'self_attn.q_norm', 'self_attn.k_norm']
         if key_list is None:
-            keys_to_load = [""] # 表示只加载 prefix.weight 本身
+            keys_to_load = [""]
         else:
             keys_to_load = [key_list] if isinstance(key_list, str) else key_list
 
         for p in keys_to_load:
-            # 拼接正确的 key
             query = f"{prefix}.weight" if p == "" else f"{prefix}{p}.weight"
-            
+            # print("Qwen3-0.6B key_name:", query)
             if query not in hf_w:
                 print(f"warning: layer {self.name} missing parameter {query}. This might be expected for some layers.")
-                # 保持空占位，以对齐参数索引
-                if p == "": return False 
-                continue
-            
-            # 将 PyTorch 权重转置到正确的设备并确保存储连续性
+
             tensor_val = hf_w[query].to(dtype).detach().cpu().contiguous()
             self.add_params(parameter(value=tensor_val, dtype=dtype, is_buffer=False))
-            
-        return True
     
     def getNuminputs(self) -> int:
         raise NotImplementedError("Subclasses must implement this function")        
 
     def getNumparams(self) -> int:
         raise NotImplementedError("Subclasses must implement this function")
-    
+
     def infer_output(self) -> List[int]:
         raise NotImplementedError("Subclasses must implement this function")
 
     def convertLayer(self, mlr_impt, sym_table):
-        # 1. 拿到当前算子本该输出的 Shape 和 Type
-        out_tensor = self.outputs[0]
-        out_shape = tuple(out_tensor.shape) # 确保是 tuple
-        
-        # 获取 MLIR 侧的类型字符串 (如 "F16", "F32", "INT32")
-        mlir_type_str = torch_to_importer_str(out_tensor.dtype)
-        out_type = mlr_impt.mlir_type[mlir_type_str]
-        
-        # 2. 建立 Numpy 类型映射，防止 MLIR 构建时类型爆炸！
-        np_dtype_map = {
-            "F32": np.float32,
-            "F16": np.float16,
-            "BF16": np.float32, # numpy 原生不支持 bf16，通常用 f32 骗过去或使用第三方库
-            "INT32": np.int32,
-            "INT64": np.int64,
-            "INT8": np.int8
-        }
-        np_type = np_dtype_map.get(mlir_type_str, np.float32)
-        
-        # 3. 动态生成对应类型和形状的全 0 假数据
-        dummy_data = np.ascontiguousarray(np.zeros(out_shape, dtype=np_type))
-        
-        # 4. 直接硬编码 stablehlo.constant，参考 test.py 的工作路径
-        result_type = mlr_impt.get_tensor_type(list(out_shape), out_type)
+        out_tensor = self.outputs[0]    # 当前模型每个 layer 都只有 1 个输出
+        out_shape = tuple(out_tensor.shape)
+
+        # 根据类型映射表获取 torch 对应到 MLIR 的 type-str  再对应到真实的 mlir_type
+        mlir_type_str = torch_to_importer_str(out_tensor.dtype)     # "F16"
+        mlir_out_type = mlr_impt.mlir_type[mlir_type_str]           # type(f16)
+
+        dummy_type = mlr_impt.numpy_type.get(mlir_type_str, MLIR_TYPE_TO_NUMPY["F32"])
+        dummy_data = np.ascontiguousarray(np.zeros(out_shape, dtype=dummy_type))
+
+        # 硬编码 stablehlo.constantOp
+        result_mlir_type = mlr_impt.get_tensor_type(list(out_shape), mlir_out_type) # eg. tensor<1x288x1024xf16>
         raw_op = torch_mlir.ir.Operation.create(
             "stablehlo.constant",
-            results=[result_type],
+            results=[result_mlir_type],
             attributes={
-                "value": DenseElementsAttr.get(dummy_data, signless=True, type=out_type)
+                "value": DenseElementsAttr.get(dummy_data, signless=True, type=mlir_out_type)
             },
             loc=Location.fused([Location.file(self.name, line=0, col=0)], context=mlr_impt.ctx),
         )
+
+        # 插入该算子
         mlr_impt.insert_point.insert(raw_op)
 
-        class _OpView(object):
-            def __init__(self, operation):
-                self.operation = operation
+        # 如果需要针对不同算子提供一个通用接口  可以使用 wrapper class
+        # class _OpView(object):
+        #     def __init__(self, operation):
+        #         self.operation = operation
+        # dummy_const = _OpView(raw_op)
 
-        dummy_const = _OpView(raw_op)
-        
-        # 5. 挂载到符号表
-        sym_table[out_tensor.name] = dummy_const.operation.results[0]
-        
+        # 把输入挂载到符号表
+        # Q: 这个符号表是怎么起作用的
+        register_operand(sym_table, out_tensor.name, raw_op.results[0])
+
         print(f"[Dummy OP] Faked node: {self.name} | Shape: {out_shape} | Type: {mlir_type_str}")
-        return dummy_const
+        return raw_op
 
+    # Manual copy constructor hook for layer obj
     def basic_clone(self):
         new_layer = self.__class__.__new__(self.__class__)
         new_layer.name = self.name
@@ -213,7 +204,6 @@ class Layer(object):
             )
         return new_layer
 
-# ================= 具体算子实现 =================
 
 class Gather_embedding(Layer):
     def __init__(self, hidden_size: int):
@@ -231,7 +221,8 @@ class Gather_embedding(Layer):
 
     def convertLayer(self, mlr_impt, sym_table):
         op = super().convertLayer(mlr_impt, sym_table)
-        op.operation.attributes["hidden_size"] = IntegerAttr.get(mlr_impt.I64Type, self.hidden_size)
+        op.attributes["hidden_size"] = IntegerAttr.get(mlr_impt.I64Type, self.hidden_size)
+        return op
     
     def basic_clone(self):
         new_layer = super().basic_clone()
@@ -244,6 +235,7 @@ class Up_projection_mm(Layer):
         self.voc_size = voc_size
     
     def getNuminputs(self): return 1
+
     def getNumparams(self) -> int: return 1
     
     def infer_output(self):
@@ -252,11 +244,12 @@ class Up_projection_mm(Layer):
         res = list(input_tensor.shape[:-1])
         res.append(emb_weight.shape[0])
         return res
-    
+
     def convertLayer(self, mlr_impt, sym_table):
         op = super().convertLayer(mlr_impt, sym_table)
-        op.operation.attributes["voc_size"] = IntegerAttr.get(mlr_impt.I64Type, self.voc_size)
-    
+        op.attributes["voc_size"] = IntegerAttr.get(mlr_impt.I64Type, self.voc_size)
+        return op
+
     def basic_clone(self):
         new_layer = super().basic_clone()
         new_layer.voc_size = self.voc_size
@@ -276,7 +269,7 @@ class LlamaAttn(Layer):
     def _generate_rotary_embedding(self, bs, seq_len, rope_scaling, rope_theta, dtype):
         self.rope_scaling = 1.0 if rope_scaling is None else rope_scaling
         
-        # 预计算 RoPE 表并存为常量 Parameter
+        # Precompute RoPE save as Parameter
         theta_i = 1.0 / (rope_theta ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim))
         position_ids = torch.arange(seq_len).repeat(bs, 1).to(torch.int32)
         self.add_params(parameter(value=position_ids, dtype=torch.int32))
@@ -289,17 +282,19 @@ class LlamaAttn(Layer):
         self.add_params(parameter(value=(emb.cos() * self.rope_scaling).to(dtype), dtype=dtype))
         self.add_params(parameter(value=(emb.sin() * self.rope_scaling).to(dtype), dtype=dtype))
     
-    def getNuminputs(self) -> int: return 1        
+    def getNuminputs(self) -> int: return 1
+       
     def getNumparams(self) -> int: return 9
+
     def infer_output(self) -> List[int]: return self.inputs[0].shape 
     
     def convertLayer(self, mlr_impt, sym_table):
         op = super().convertLayer(mlr_impt, sym_table)
-        op.operation.attributes["attention_bias"] = IntegerAttr.get(mlr_impt.I64Type, self.attention_bias)
-        op.operation.attributes["drop_out"] = FloatAttr.get(mlr_impt.F32Type, self.drop_out)
-        op.operation.attributes["num_head"] = IntegerAttr.get(mlr_impt.I64Type, self.num_head)
-        op.operation.attributes["head_dim"] = IntegerAttr.get(mlr_impt.I64Type, self.head_dim)
-        op.operation.attributes["num_key_value_heads"] = IntegerAttr.get(mlr_impt.I64Type, self.num_key_value_heads)   
+        op.attributes["attention_bias"] = IntegerAttr.get(mlr_impt.I64Type, self.attention_bias)
+        op.attributes["drop_out"] = FloatAttr.get(mlr_impt.F32Type, self.drop_out)
+        op.attributes["num_head"] = IntegerAttr.get(mlr_impt.I64Type, self.num_head)
+        op.attributes["head_dim"] = IntegerAttr.get(mlr_impt.I64Type, self.head_dim)
+        op.attributes["num_key_value_heads"] = IntegerAttr.get(mlr_impt.I64Type, self.num_key_value_heads)
         return op
     
     def basic_clone(self):
@@ -316,17 +311,19 @@ class Mlp(Layer):
         super().__init__()
         self.hidden_act = hidden_act
         self.intermediate_size = intermediate_size
-    
+
     def getNuminputs(self) -> int: return 1
+
     def getNumparams(self) -> int: return 3
+
     def infer_output(self) -> List[int]: return self.inputs[0].shape
 
     def convertLayer(self, mlr_impt, sym_table):
         op = super().convertLayer(mlr_impt, sym_table)
-        op.operation.attributes["intermediate_size"] = IntegerAttr.get(mlr_impt.I64Type, self.intermediate_size)
-        op.operation.attributes["hidden_act"] = StringAttr.get(self.hidden_act)
+        op.attributes["intermediate_size"] = IntegerAttr.get(mlr_impt.I64Type, self.intermediate_size)
+        op.attributes["hidden_act"] = StringAttr.get(self.hidden_act)
         return op
-    
+
     def basic_clone(self):
         new_layer = super().basic_clone()
         new_layer.hidden_act = self.hidden_act
@@ -337,16 +334,18 @@ class LlamaRmsNorm(Layer):
     def __init__(self, rms_norm_eps: float):
         super().__init__()
         self.rms_norm_eps = rms_norm_eps
-    
+
     def getNuminputs(self) -> int: return 1
+
     def getNumparams(self) -> int: return 1
+
     def infer_output(self) -> List[int]: return self.inputs[0].shape
-    
+
     def convertLayer(self, mlr_impt, sym_table):
         op = super().convertLayer(mlr_impt, sym_table)
-        op.operation.attributes["rms_norm_eps"] = FloatAttr.get(mlr_impt.F32Type, self.rms_norm_eps) 
+        op.attributes["rms_norm_eps"] = FloatAttr.get(mlr_impt.F32Type, self.rms_norm_eps)
         return op
-        
+
     def basic_clone(self):
         new_layer = super().basic_clone()
         new_layer.rms_norm_eps = self.rms_norm_eps
@@ -359,6 +358,7 @@ class LlamaMatmul(Layer):
         self.intermediate_size = intermediate_size
 
     def getNuminputs(self) -> int: return 1
+
     def getNumparams(self) -> int: return 1
 
     def infer_output(self) -> List[int]:
@@ -369,4 +369,4 @@ class LlamaMatmul(Layer):
     def convertLayer(self, mlr_impt, sym_table):
         return super().convertLayer(mlr_impt, sym_table)
 
-__all__ = ["LlamaRmsNorm","Mlp","LlamaAttn","Up_projection_mm","Gather_embedding","Layer","parameter","Tensor","torch_to_importer_str"]
+__all__ = ["LlamaRmsNorm","Mlp","LlamaAttn","Up_projection_mm","Gather_embedding","Layer","parameter","Tensor","torch_to_importer_str", "register_operand"]
