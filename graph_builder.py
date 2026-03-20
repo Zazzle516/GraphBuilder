@@ -106,7 +106,7 @@ class GraphBuilder(object):
             register_operand(self.symbol_table, tensor.name, argument)
 
         for sub_layer in self._layers:
-            sub_layer.convertLayer(self.importer, self.symbol_table)
+            sub_layer._convertLayer(self.importer, self.symbol_table)
 
         return_op = list()
         for tensor in self._outputs:

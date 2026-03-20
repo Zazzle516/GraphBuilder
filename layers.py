@@ -180,10 +180,113 @@ class Layer(object):
         # dummy_const = _OpView(raw_op)
 
         # 把输入挂载到符号表
-        # Q: 这个符号表是怎么起作用的
         register_operand(sym_table, out_tensor.name, raw_op.results[0])
 
         print(f"[Dummy OP] Faked node: {self.name} | Shape: {out_shape} | Type: {mlir_type_str}")
+        return raw_op
+
+    def _convertLayer(self, mlr_impt, sym_table):
+        if hasattr(mlr_impt.ctx, "allow_unregistered_dialects"):
+            mlr_impt.ctx.allow_unregistered_dialects = True
+
+        out_tensor = self.outputs[0]
+        out_shape = tuple(out_tensor.shape)
+        mlir_type_str = torch_to_importer_str(out_tensor.dtype)
+        mlir_out_type = mlr_impt.mlir_type[mlir_type_str]
+        result_mlir_type = mlr_impt.get_tensor_type(list(out_shape), mlir_out_type)
+
+        # 从 sym_table 读取对应的 SSA
+        input_operands = []     # eg. [<torch_mlir._mlir_libs._mlir.ir.OpResult object at 0x74f2a25caaf0>]
+        for tensor in self.inputs:
+            if tensor.name not in sym_table:
+                raise KeyError(f"operand {tensor.name} not found for layer {self.name}")
+            input_operands.append(sym_table[tensor.name])
+
+        param_operands = []
+        for index, param in enumerate(self.params):
+            if param is None:
+                continue
+            if param.dtype is None:
+                raise ValueError(f"layer {self.name} parameter {index} is missing dtype information")
+
+            param_type_str = torch_to_importer_str(param.dtype)
+            param_element_type = mlr_impt.mlir_type[param_type_str]
+            param_tensor_type = mlr_impt.get_tensor_type(list(param.shape), param_element_type)
+
+            value_array = None
+            if param.value is not None:
+                if isinstance(param.value, torch.Tensor):
+                    tensor_value = param.value.detach().cpu()
+                    if param_type_str == "BF16":
+                        tensor_value = tensor_value.to(torch.float32)
+                    value_array = np.ascontiguousarray(tensor_value.numpy())
+                else:
+                    numpy_dtype = mlr_impt.numpy_type.get(param_type_str, MLIR_TYPE_TO_NUMPY["F32"])
+                    value_array = np.ascontiguousarray(np.asarray(param.value, dtype=numpy_dtype))
+
+            numel = int(np.prod(param_tensor_type.shape)) if len(param_tensor_type.shape) > 0 else 1
+            if value_array is not None and numel <= 128:
+                dense_attr = DenseElementsAttr.get(value_array, signless=True, type=param_element_type)
+            elif param_type_str in {"INT8", "UINT8", "SINT8", "INT16", "UINT16", "INT32", "UINT32", "INT64", "UINT64", "BOOL"}:
+                dense_attr = DenseElementsAttr.get_splat(param_tensor_type, IntegerAttr.get(param_element_type, 0))
+            else:
+                dense_attr = DenseElementsAttr.get_splat(param_tensor_type, FloatAttr.get(param_element_type, 0.0))
+
+            param_op = torch_mlir.ir.Operation.create(
+                "stablehlo.constant",
+                results=[param_tensor_type],
+                attributes={"value": dense_attr},
+                loc=Location.fused(
+                    [Location.file(f"{self.name}:param{index}", line=0, col=0)],
+                    context=mlr_impt.ctx,
+                ),
+            )
+            mlr_impt.insert_point.insert(param_op)
+            param_operands.append(param_op.results[0])
+
+        op_name_chars = []
+        class_name = self.__class__.__name__
+        for idx, char in enumerate(class_name):
+            should_split = (
+                idx > 0
+                and char.isupper()
+                and (
+                    class_name[idx - 1].islower()
+                    or (idx + 1 < len(class_name) and class_name[idx + 1].islower())
+                )
+            )
+            if should_split:
+                op_name_chars.append("_")
+            op_name_chars.append(char.lower())
+        op_name = f"graphbuilder.{''.join(op_name_chars)}"
+
+        attributes = {
+            "layer_name": StringAttr.get(self.name or class_name),
+            "operand_count": IntegerAttr.get(mlr_impt.I64Type, len(input_operands)),
+            "param_count": IntegerAttr.get(mlr_impt.I64Type, len(param_operands)),
+            "has_residual": IntegerAttr.get(mlr_impt.I64Type, int(self.has_residual)),
+        }
+        for attr_name, attr_value in self.__dict__.items():
+            if attr_name in {"name", "inputs", "outputs", "params", "has_residual"} or attr_value is None:
+                continue
+            if isinstance(attr_value, bool):
+                attributes[attr_name] = IntegerAttr.get(mlr_impt.I64Type, int(attr_value))
+            elif isinstance(attr_value, int):
+                attributes[attr_name] = IntegerAttr.get(mlr_impt.I64Type, attr_value)
+            elif isinstance(attr_value, float):
+                attributes[attr_name] = FloatAttr.get(mlr_impt.F32Type, attr_value)
+            elif isinstance(attr_value, str):
+                attributes[attr_name] = StringAttr.get(attr_value)
+
+        raw_op = torch_mlir.ir.Operation.create(
+            op_name,
+            operands=input_operands + param_operands,
+            results=[result_mlir_type],
+            attributes=attributes,
+            loc=Location.fused([Location.file(self.name, line=0, col=0)], context=mlr_impt.ctx),
+        )
+        mlr_impt.insert_point.insert(raw_op)
+        register_operand(sym_table, out_tensor.name, raw_op.results[0])
         return raw_op
 
     # Manual copy constructor hook for layer obj
